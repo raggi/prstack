@@ -38,8 +38,9 @@ func prInfoFromJSON(pr prJSON) PRInfo {
 // collectPRs lists every PR whose head branch is part of this stack
 // (prefix-*) and returns them keyed by head branch.  One gh call instead
 // of one per branch.
-func collectPRs(prefix string) (map[string]prRecord, error) {
+func collectPRs(prefix, repo string) (map[string]prRecord, error) {
 	out, err := ghOutErr("pr", "list",
+		"--repo", repo,
 		"--state", "all",
 		"--limit", "500",
 		"--json", "number,url,state,title,baseRefName,isDraft,headRefName,body",

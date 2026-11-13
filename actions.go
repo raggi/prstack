@@ -34,7 +34,11 @@ func (s *Stack) Open(n int) error {
 	if entry.PR.Number == 0 {
 		return fmt.Errorf("no PR for entry %d — run Sync first", n)
 	}
-	return passthrough("gh", "pr", "view", strconv.Itoa(entry.PR.Number), "--web")
+	repo, err := s.repository()
+	if err != nil {
+		return err
+	}
+	return passthrough("gh", "pr", "view", strconv.Itoa(entry.PR.Number), "--repo", repo, "--web")
 }
 
 // ── link ──────────────────────────────────────────────────────────────────────
@@ -59,7 +63,11 @@ func (s *Stack) Link(n int, branch string) error {
 			return fmt.Errorf("branch %s is already matched to entry %d — link that entry elsewhere first", branch, e.Idx)
 		}
 	}
-	prs, err := collectPRs(s.Prefix)
+	repo, err := s.repository()
+	if err != nil {
+		return err
+	}
+	prs, err := collectPRs(s.Prefix, repo)
 	if err != nil {
 		return err
 	}
@@ -82,7 +90,7 @@ func (s *Stack) Link(n int, branch string) error {
 		PatchID:  entry.Commit.PatchID,
 	}
 	body := joinBodyManifest(StripManifest(rec.PR.Body), man.Serialize())
-	if err := ghEditPR(rec.PR.Number, entry.Commit.Title, body, ""); err != nil {
+	if err := ghEditPR(repo, rec.PR.Number, entry.Commit.Title, body, ""); err != nil {
 		return fmt.Errorf("gh pr edit: %w", err)
 	}
 

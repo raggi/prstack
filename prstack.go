@@ -142,6 +142,7 @@ type Stack struct {
 	Draft   bool   // whether Sync creates new PRs as drafts
 	Entries []StackEntry
 	Orphans []Orphan
+	repo    string
 }
 
 // Entry returns stack entry n (1-indexed, oldest first).
@@ -181,6 +182,11 @@ func Load(opts Options) (*Stack, error) {
 		return nil, err
 	}
 
+	repo, err := githubRepo(remote)
+	if err != nil {
+		return nil, err
+	}
+
 	fork, err := findForkSHA(remote, base)
 	if err != nil {
 		return nil, err
@@ -190,7 +196,7 @@ func Load(opts Options) (*Stack, error) {
 		return nil, err
 	}
 
-	stack, err := buildStack(commits, prefix, base)
+	stack, err := buildStack(commits, prefix, base, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +368,11 @@ func gitConfig(key string) string {
 // is the remote half of the stack state; combine with local commits via
 // Load for full reconciliation.
 func ListPRs(prefix string) ([]PRInfo, error) {
-	prs, err := collectPRs(prefix)
+	repo, err := (&Stack{}).repository()
+	if err != nil {
+		return nil, err
+	}
+	prs, err := collectPRs(prefix, repo)
 	if err != nil {
 		return nil, err
 	}
@@ -389,12 +399,14 @@ func sortedBranches(prs map[string]prRecord) []string {
 
 // buildStack reconciles local commits against the stack's existing PRs
 // (one gh call) and chains each entry's base to the branch below it.
-func buildStack(commits []Commit, prefix, base string) (*Stack, error) {
-	prs, err := collectPRs(prefix)
+func buildStack(commits []Commit, prefix, base, repo string) (*Stack, error) {
+	prs, err := collectPRs(prefix, repo)
 	if err != nil {
 		return nil, err
 	}
-	return reconcile(commits, prefix, base, prs), nil
+	stack := reconcile(commits, prefix, base, prs)
+	stack.repo = repo
+	return stack, nil
 }
 
 // reconcile pairs commits with existing PR manifests.  Matching precedence

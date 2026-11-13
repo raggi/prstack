@@ -75,6 +75,11 @@ func (s *Stack) Sync(o SyncOptions) (*SyncReport, error) {
 		return report, nil
 	}
 
+	repo, err := s.repository()
+	if err != nil {
+		return nil, err
+	}
+
 	dryTag := ""
 	if o.DryRun {
 		dryTag = "[dry-run] "
@@ -134,7 +139,7 @@ func (s *Stack) Sync(o SyncOptions) (*SyncReport, error) {
 				updates = append(updates, fmt.Sprintf("base → %s", entry.BaseBranch))
 			}
 			if !o.DryRun {
-				if err := ghEditPR(entry.PR.Number, entry.Commit.Title, body, newBase); err != nil {
+				if err := ghEditPR(repo, entry.PR.Number, entry.Commit.Title, body, newBase); err != nil {
 					o.logf("  ✗ gh pr edit: %v", err)
 					fail(err)
 					continue
@@ -153,7 +158,7 @@ func (s *Stack) Sync(o SyncOptions) (*SyncReport, error) {
 				report.Entries = append(report.Entries, res)
 				continue
 			}
-			num, url, err := ghCreatePR(entry.Branch, entry.BaseBranch,
+			num, url, err := ghCreatePR(repo, entry.Branch, entry.BaseBranch,
 				entry.Commit.Title, body, s.Draft)
 			if err != nil {
 				o.logf("  ✗ gh pr create: %v", err)
@@ -215,8 +220,9 @@ func pushBranch(remote, branch, sha string, dryRun bool) error {
 
 var prURLRe = regexp.MustCompile(`/pull/(\d+)`)
 
-func ghCreatePR(branch, base, title, body string, draft bool) (int, string, error) {
+func ghCreatePR(repo, branch, base, title, body string, draft bool) (int, string, error) {
 	args := []string{"gh", "pr", "create",
+		"--repo", repo,
 		"--head", branch,
 		"--base", base,
 		"--title", title,
@@ -238,8 +244,9 @@ func ghCreatePR(branch, base, title, body string, draft bool) (int, string, erro
 	return num, url, nil
 }
 
-func ghEditPR(number int, title, body, newBase string) error {
+func ghEditPR(repo string, number int, title, body, newBase string) error {
 	args := []string{"gh", "pr", "edit", strconv.Itoa(number),
+		"--repo", repo,
 		"--title", title,
 		"--body-file", "-",
 	}
