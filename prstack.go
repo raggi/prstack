@@ -42,6 +42,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -57,14 +58,14 @@ var isTTY = func() bool {
 }()
 
 const (
-	ansiReset = "\033[0m"
-	ansiBold  = "\033[1m"
-	ansiDim   = "\033[2m"
-	ansiRed   = "\033[31m"
-	ansiGreen = "\033[32m"
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
 	ansiYellow = "\033[33m"
-	ansiBlue  = "\033[34m"
-	ansiCyan  = "\033[36m"
+	ansiBlue   = "\033[34m"
+	ansiCyan   = "\033[36m"
 )
 
 func col(s string, codes ...string) string {
@@ -160,7 +161,7 @@ type Commit struct {
 
 // StackEntry is one slot in the stack — one commit, one branch, one PR.
 type StackEntry struct {
-	Idx        int    // 1-indexed (1 = oldest, closest to base)
+	Idx        int // 1-indexed (1 = oldest, closest to base)
 	Commit     Commit
 	Branch     string // local/remote branch for this commit
 	BaseBranch string // PR target on GitHub
@@ -190,6 +191,45 @@ func detectRemote() string {
 	}
 	die("no git remotes configured")
 	return ""
+}
+
+func githubRepo(remote string) (string, error) {
+	r := git("remote", "get-url", "--push", remote)
+	if r.Code != 0 {
+		return "", fmt.Errorf("remote %q: %s", remote, r.Stderr)
+	}
+	repo, err := repoFromURL(r.Stdout)
+	if err != nil {
+		return "", fmt.Errorf("remote %q: %w", remote, err)
+	}
+	return repo, nil
+}
+
+func repoFromURL(raw string) (string, error) {
+	var host, path string
+	if strings.Contains(raw, "://") {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return "", fmt.Errorf("invalid GitHub remote URL %q: %w", raw, err)
+		}
+		switch u.Scheme {
+		case "https", "http", "ssh", "git":
+			host, path = u.Hostname(), u.Path
+		}
+	} else if before, after, ok := strings.Cut(raw, ":"); ok {
+		// Git also accepts scp-style SSH URLs: git@host:owner/repo.git.
+		_, host, ok = strings.Cut(before, "@")
+		if !ok {
+			host = before
+		}
+		path = after
+	}
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+	parts := strings.Split(path, "/")
+	if host == "" || strings.ContainsAny(host, "/\\") || len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("cannot determine GitHub repository from remote URL %q", raw)
+	}
+	return host + "/" + path, nil
 }
 
 func findForkSHA(remote, base string) string {
@@ -299,10 +339,11 @@ type prJSON struct {
 
 // fetchPRInfo queries GitHub for PR state for each branch in the list.
 // Returns a map from branch name to PR metadata.
-func fetchPRInfo(branches []string) map[string]prJSON {
+func fetchPRInfo(repo string, branches []string) map[string]prJSON {
 	result := make(map[string]prJSON, len(branches))
 	for _, branch := range branches {
 		r := runCmd("", "gh", "pr", "list",
+			"--repo", repo,
 			"--head", branch,
 			"--state", "all",
 			"--json", "number,url,state,title,baseRefName,isDraft",
@@ -327,7 +368,7 @@ func fetchPRInfo(branches []string) map[string]prJSON {
 
 // ── stack builder ─────────────────────────────────────────────────────────────
 
-func buildStack(commits []Commit, prefix, baseBranch string) []StackEntry {
+func buildStack(commits []Commit, prefix, baseBranch, repo string) []StackEntry {
 	entries := make([]StackEntry, len(commits))
 	branches := make([]string, len(commits))
 
@@ -346,17 +387,17 @@ func buildStack(commits []Commit, prefix, baseBranch string) []StackEntry {
 		branches[i] = br
 	}
 
-	prInfo := fetchPRInfo(branches)
+	prInfo := fetchPRInfo(repo, branches)
 	for i, entry := range entries {
 		info, ok := prInfo[entry.Branch]
 		if !ok {
 			continue
 		}
 		entries[i].PRNumber = info.Number
-		entries[i].PRURL    = info.URL
-		entries[i].PRState  = info.State
-		entries[i].PRTitle  = info.Title
-		entries[i].PRBase   = info.BaseRefName
+		entries[i].PRURL = info.URL
+		entries[i].PRState = info.State
+		entries[i].PRTitle = info.Title
+		entries[i].PRBase = info.BaseRefName
 	}
 	return entries
 }
@@ -400,9 +441,9 @@ func cmdStatus(stack []StackEntry, prefix, base string) {
 	}
 
 	for _, entry := range stack {
-		shaS  := col(shortSHA(entry.Commit.SHA), ansiDim)
-		idxS  := col(fmt.Sprintf("[%d]", entry.Idx), ansiBold)
-		brS   := col(entry.Branch, ansiCyan)
+		shaS := col(shortSHA(entry.Commit.SHA), ansiDim)
+		idxS := col(fmt.Sprintf("[%d]", entry.Idx), ansiBold)
+		brS := col(entry.Branch, ansiCyan)
 
 		cidWarn := ""
 		if entry.Commit.ChangeID == "" {
@@ -414,8 +455,8 @@ func cmdStatus(stack []StackEntry, prefix, base string) {
 			if codes == nil {
 				codes = []string{}
 			}
-			prS     := col(fmt.Sprintf("#%d", entry.PRNumber), append(codes, ansiBold)...)
-			stateS  := col("("+entry.PRState+")", codes...)
+			prS := col(fmt.Sprintf("#%d", entry.PRNumber), append(codes, ansiBold)...)
+			stateS := col("("+entry.PRState+")", codes...)
 
 			baseNote := ""
 			if entry.PRBase != "" && entry.PRBase != entry.BaseBranch {
@@ -473,8 +514,9 @@ func pushBranch(remote, branch, sha string, dryRun bool) error {
 
 var prURLRe = regexp.MustCompile(`/pull/(\d+)`)
 
-func ghCreatePR(branch, base, title, body string, draft bool) (int, string, error) {
+func ghCreatePR(repo, branch, base, title, body string, draft bool) (int, string, error) {
 	args := []string{"gh", "pr", "create",
+		"--repo", repo,
 		"--head", branch,
 		"--base", base,
 		"--title", title,
@@ -496,8 +538,9 @@ func ghCreatePR(branch, base, title, body string, draft bool) (int, string, erro
 	return num, url, nil
 }
 
-func ghEditPR(number int, title, body, newBase string) error {
+func ghEditPR(repo string, number int, title, body, newBase string) error {
 	args := []string{"gh", "pr", "edit", strconv.Itoa(number),
+		"--repo", repo,
 		"--title", title,
 		"--body-file", "-",
 	}
@@ -511,7 +554,7 @@ func ghEditPR(number int, title, body, newBase string) error {
 	return nil
 }
 
-func cmdSync(stack []StackEntry, remote string, draft, dryRun, verbose bool) {
+func cmdSync(stack []StackEntry, remote, repo string, draft, dryRun, verbose bool) {
 	if len(stack) == 0 {
 		fmt.Println("Nothing to sync — no commits above base.")
 		return
@@ -567,7 +610,7 @@ func cmdSync(stack []StackEntry, remote string, draft, dryRun, verbose bool) {
 			}
 
 			if !dryRun {
-				if err := ghEditPR(entry.PRNumber, entry.Commit.Title, body, newBase); err != nil {
+				if err := ghEditPR(repo, entry.PRNumber, entry.Commit.Title, body, newBase); err != nil {
 					fmt.Println(col("  ✗ gh pr edit: "+err.Error(), ansiRed))
 					continue
 				}
@@ -583,15 +626,15 @@ func cmdSync(stack []StackEntry, remote string, draft, dryRun, verbose bool) {
 					dryTag, entry.Branch, entry.BaseBranch)
 				continue
 			}
-			num, url, err := ghCreatePR(entry.Branch, entry.BaseBranch,
+			num, url, err := ghCreatePR(repo, entry.Branch, entry.BaseBranch,
 				entry.Commit.Title, body, draft)
 			if err != nil {
 				fmt.Println(col("  ✗ gh pr create: "+err.Error(), ansiRed))
 				continue
 			}
 			entry.PRNumber = num
-			entry.PRURL    = url
-			entry.PRState  = "OPEN"
+			entry.PRURL = url
+			entry.PRState = "OPEN"
 			if draft {
 				entry.PRState = "DRAFT"
 			}
@@ -622,12 +665,12 @@ func cmdCheckout(stack []StackEntry, n int) {
 
 // ── open command ──────────────────────────────────────────────────────────────
 
-func cmdOpen(stack []StackEntry, n int) {
+func cmdOpen(stack []StackEntry, n int, repo string) {
 	entry := resolveIndex(stack, n)
 	if entry.PRNumber == 0 {
 		die("no PR for entry %d — run `prstack sync` first", n)
 	}
-	passthrough("gh", "pr", "view", strconv.Itoa(entry.PRNumber), "--web")
+	passthrough("gh", "pr", "view", strconv.Itoa(entry.PRNumber), "--repo", repo, "--web")
 }
 
 // ── clean command ─────────────────────────────────────────────────────────────
@@ -700,13 +743,13 @@ func main() {
 	fs := flag.NewFlagSet("prstack", flag.ContinueOnError)
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 
-	baseFlag   := fs.String("base", "", "upstream base branch")
+	baseFlag := fs.String("base", "", "upstream base branch")
 	remoteFlag := fs.String("remote", "", "git remote")
 	prefixFlag := fs.String("prefix", "", "branch prefix override")
-	draftFlag  := fs.Bool("draft", true, "create new PRs as draft")
-	noDraft    := fs.Bool("no-draft", false, "create new PRs as ready")
-	dryRun     := fs.Bool("dry-run", false, "print actions, no changes")
-	verbose    := fs.Bool("v", false, "verbose output")
+	draftFlag := fs.Bool("draft", true, "create new PRs as draft")
+	noDraft := fs.Bool("no-draft", false, "create new PRs as ready")
+	dryRun := fs.Bool("dry-run", false, "print actions, no changes")
+	verbose := fs.Bool("v", false, "verbose output")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		os.Exit(2)
@@ -739,7 +782,7 @@ func main() {
 	}
 
 	remote := resolve(*remoteFlag, "remote", detectRemote())
-	base   := resolve(*baseFlag, "base", "main")
+	base := resolve(*baseFlag, "base", "main")
 	prefix := resolve(*prefixFlag, "prefix", branch)
 
 	// Draft: --no-draft wins over --draft; then git config; then default true.
@@ -760,15 +803,20 @@ func main() {
 		))
 	}
 
+	repo, err := githubRepo(remote)
+	if err != nil {
+		die("%s", err)
+	}
+
 	// Build stack
-	fork    := findForkSHA(remote, base)
+	fork := findForkSHA(remote, base)
 	commits := commitsSince(fork)
 
 	if *verbose {
 		fmt.Println(col(fmt.Sprintf("fork sha: %s  commits: %d", shortSHA(fork), len(commits)), ansiDim))
 	}
 
-	stack := buildStack(commits, prefix, base)
+	stack := buildStack(commits, prefix, base, repo)
 
 	// Dispatch
 	switch command {
@@ -776,7 +824,7 @@ func main() {
 		cmdStatus(stack, prefix, base)
 
 	case "sync":
-		cmdSync(stack, remote, draft, *dryRun, *verbose)
+		cmdSync(stack, remote, repo, draft, *dryRun, *verbose)
 
 	case "checkout":
 		if len(cmdArgs) == 0 {
@@ -796,7 +844,7 @@ func main() {
 		if err != nil {
 			die("invalid index: %s", cmdArgs[0])
 		}
-		cmdOpen(stack, n)
+		cmdOpen(stack, n, repo)
 
 	case "clean":
 		cmdClean(stack, remote, *dryRun)
